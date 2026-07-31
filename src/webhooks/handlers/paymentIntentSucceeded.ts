@@ -2,11 +2,15 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type Stripe from 'stripe';
 
 import { log } from '../../lib/log';
+import { sendBookingConfirmation } from './bookingConfirmed';
 
 interface BookingRow {
   id: string;
   status: string;
   slot_id: string;
+  buyer_id: string;
+  listing_id: string;
+  amount_cents: number;
 }
 
 /**
@@ -21,6 +25,11 @@ interface BookingRow {
  * event), nothing is re-applied, so automatic retries and dashboard replays
  * have no duplicate side effects.
  *
+ * The confirmation email is sent on both the fresh and the replay path: a
+ * replay is the retry vehicle when the first attempt's email send threw, and
+ * duplicate sends are deduped by Resend's idempotency keys. See
+ * `sendBookingConfirmation`.
+ *
  * Throws on any failure so the router can return non-2xx and let Stripe retry.
  */
 export async function handlePaymentIntentSucceeded(
@@ -32,7 +41,7 @@ export async function handlePaymentIntentSucceeded(
 
   const { data, error } = await supabase
     .from('bookings')
-    .select('id, status, slot_id')
+    .select('id, status, slot_id, buyer_id, listing_id, amount_cents')
     .eq('stripe_payment_intent_id', paymentIntentId)
     .single();
 
@@ -43,11 +52,11 @@ export async function handlePaymentIntentSucceeded(
   const booking = data as BookingRow;
 
   if (booking.status === 'confirmed') {
-    // Stripe redelivered an event we already processed — no booking write and
-    // no duplicate email. Self-heal the slot: if a previous attempt
-    // partially failed (booking confirmed but the slot update errored before the
-    // handler returned non-2xx), ensure the slot ends up booked. Writing only
-    // when needed keeps a fully-processed replay a zero-write no-op.
+    // Stripe redelivered an event we already processed — no booking write.
+    // Self-heal the slot: if a previous attempt partially failed (booking
+    // confirmed but the slot update errored before the handler returned
+    // non-2xx), ensure the slot ends up booked. Writing only when needed keeps
+    // a fully-processed replay a zero-write no-op.
     const { data: slot, error: slotFetchError } = await supabase
       .from('availability_slots')
       .select('is_booked')
@@ -64,6 +73,8 @@ export async function handlePaymentIntentSucceeded(
         throw new Error(`Failed to mark slot ${booking.slot_id} booked: ${slotError.message}`);
       }
     }
+
+    await sendBookingConfirmation(booking, supabase);
 
     log('info', 'webhook.idempotent', { paymentIntentId, bookingId: booking.id });
     return;
@@ -86,6 +97,8 @@ export async function handlePaymentIntentSucceeded(
   if (slotError) {
     throw new Error(`Failed to mark slot ${booking.slot_id} booked: ${slotError.message}`);
   }
+
+  await sendBookingConfirmation(booking, supabase);
 
   log('info', 'webhook.booking_confirmed', {
     paymentIntentId,

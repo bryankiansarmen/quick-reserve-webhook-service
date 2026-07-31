@@ -5,13 +5,15 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { createApp } from '../../app';
 
-const { stripeMock, supabaseMock } = vi.hoisted(() => ({
+const { stripeMock, supabaseMock, emailMock } = vi.hoisted(() => ({
   stripeMock: { getStripe: vi.fn() },
   supabaseMock: { getSupabase: vi.fn() },
+  emailMock: { sendBookingConfirmationEmail: vi.fn() },
 }));
 
 vi.mock('../../lib/stripe', () => stripeMock);
 vi.mock('../../lib/supabase', () => supabaseMock);
+vi.mock('../../lib/email', () => emailMock);
 
 const WEBHOOK_SECRET = 'whsec_test_secret_for_signature_verification';
 const STRIPE_KEY = 'sk_test_dummy_key_for_local_signature_verification';
@@ -22,9 +24,11 @@ const stripe = new Stripe(STRIPE_KEY);
 const PI_ID = 'pi_test_123';
 const BOOKING_ID = 'booking-123';
 const SLOT_ID = 'slot-456';
+const BUYER_ID = 'buyer-1';
+const SELLER_ID = 'seller-2';
 
 interface BookingSelectResult {
-  data: { id: string; status: string; slot_id: string } | null;
+  data: { id: string; status: string; slot_id: string; buyer_id: string; listing_id: string; amount_cents: number } | null;
   error: { message: string } | null;
 }
 
@@ -33,6 +37,7 @@ interface FakeSupabase {
   bookingUpdate: ReturnType<typeof vi.fn>;
   slotUpdate: ReturnType<typeof vi.fn>;
   fromCalls: string[];
+  getUserById: ReturnType<typeof vi.fn>;
 }
 
 function createFakeSupabase(options: {
@@ -40,12 +45,42 @@ function createFakeSupabase(options: {
   slotSelectResult?: { data: { is_booked: boolean } | null; error: { message: string } | null };
   bookingUpdateError?: { message: string };
   slotUpdateError?: { message: string };
+  listingResult?: { data: { title: string; seller_id: string } | null; error: { message: string } | null };
+  slotFetchResult?: { data: { start_time: string; end_time: string } | null; error: { message: string } | null };
+  buyerProfileResult?: { data: { full_name: string } | null; error: { message: string } | null };
+  sellerProfileResult?: { data: { full_name: string } | null; error: { message: string } | null };
+  buyerUserResult?: { data: { user: { email: string } | null } | null; error: { message: string } | null };
+  sellerUserResult?: { data: { user: { email: string } | null } | null; error: { message: string } | null };
 }): FakeSupabase {
   const bookingUpdate = vi.fn();
   const slotUpdate = vi.fn();
   const fromCalls: string[] = [];
 
   const slotSelectResult = options.slotSelectResult ?? { data: { is_booked: true }, error: null };
+  const listingResult = options.listingResult ?? {
+    data: { title: 'Sunlit Photography Studio', seller_id: SELLER_ID },
+    error: null,
+  };
+  const slotFetchResult = options.slotFetchResult ?? {
+    data: { start_time: '2026-08-01T10:00:00.000Z', end_time: '2026-08-01T12:00:00.000Z' },
+    error: null,
+  };
+  const buyerProfileResult = options.buyerProfileResult ?? {
+    data: { full_name: 'Buyer User' },
+    error: null,
+  };
+  const sellerProfileResult = options.sellerProfileResult ?? {
+    data: { full_name: 'Seller User' },
+    error: null,
+  };
+  const buyerUserResult = options.buyerUserResult ?? {
+    data: { user: { email: 'buyer@example.com' } },
+    error: null,
+  };
+  const sellerUserResult = options.sellerUserResult ?? {
+    data: { user: { email: 'seller@example.com' } },
+    error: null,
+  };
 
   const from = vi.fn((table: string) => {
     fromCalls.push(table);
@@ -66,9 +101,11 @@ function createFakeSupabase(options: {
     }
     if (table === 'availability_slots') {
       return {
-        select: vi.fn(() => ({
+        select: vi.fn((columns: string) => ({
           eq: vi.fn(() => ({
-            single: vi.fn().mockResolvedValue(slotSelectResult),
+            single: vi.fn().mockResolvedValue(
+              columns.includes('is_booked') ? slotSelectResult : slotFetchResult
+            ),
           })),
         })),
         update: vi.fn((values: unknown) => {
@@ -79,10 +116,46 @@ function createFakeSupabase(options: {
         }),
       };
     }
+    if (table === 'listings') {
+      return {
+        select: vi.fn(() => ({
+          eq: vi.fn(() => ({
+            single: vi.fn().mockResolvedValue(listingResult),
+          })),
+        })),
+      };
+    }
+    if (table === 'profiles') {
+      return {
+        select: vi.fn(() => ({
+          eq: vi.fn((_column: string, id: string) => ({
+            single: vi.fn().mockResolvedValue(
+              String(id) === BUYER_ID ? buyerProfileResult : sellerProfileResult
+            ),
+          })),
+        })),
+      };
+    }
     throw new Error(`Unexpected table queried by handler: ${table}`);
   });
 
-  return { supabase: { from }, bookingUpdate, slotUpdate, fromCalls };
+  const getUserById = vi.fn((id: string) => {
+    if (String(id) === BUYER_ID) {
+      return Promise.resolve(buyerUserResult);
+    }
+    if (String(id) === SELLER_ID) {
+      return Promise.resolve(sellerUserResult);
+    }
+    return Promise.resolve({ data: { user: null }, error: null });
+  });
+
+  return {
+    supabase: { from, auth: { admin: { getUserById } } },
+    bookingUpdate,
+    slotUpdate,
+    fromCalls,
+    getUserById,
+  };
 }
 
 function signedEvent(type: string, dataObject: Record<string, unknown>) {
@@ -112,7 +185,37 @@ beforeEach(() => {
   stripeMock.getStripe.mockReset();
   stripeMock.getStripe.mockReturnValue(stripe);
   supabaseMock.getSupabase.mockReset();
+  emailMock.sendBookingConfirmationEmail.mockReset();
+  emailMock.sendBookingConfirmationEmail.mockResolvedValue(undefined);
 });
+
+function pendingBooking() {
+  return {
+    data: {
+      id: BOOKING_ID,
+      status: 'pending',
+      slot_id: SLOT_ID,
+      buyer_id: BUYER_ID,
+      listing_id: 'listing-7',
+      amount_cents: 8500,
+    },
+    error: null,
+  };
+}
+
+function confirmedBooking() {
+  return {
+    data: {
+      id: BOOKING_ID,
+      status: 'confirmed',
+      slot_id: SLOT_ID,
+      buyer_id: BUYER_ID,
+      listing_id: 'listing-7',
+      amount_cents: 8500,
+    },
+    error: null,
+  };
+}
 
 describe('POST /webhooks/stripe', () => {
   it('rejects a request with an invalid Stripe-Signature header (400)', async () => {
@@ -157,13 +260,8 @@ describe('POST /webhooks/stripe', () => {
     expect(res.body.error.code).toBe('INTERNAL_ERROR');
   });
 
-  it('confirms the booking and marks its slot booked on payment_intent.succeeded', async () => {
-    const fake = createFakeSupabase({
-      bookingSelectResult: {
-        data: { id: BOOKING_ID, status: 'pending', slot_id: SLOT_ID },
-        error: null,
-      },
-    });
+  it('confirms the booking, marks its slot booked, and emails both parties on payment_intent.succeeded', async () => {
+    const fake = createFakeSupabase({ bookingSelectResult: pendingBooking() });
     supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
 
     const { payload, signature } = signedEvent('payment_intent.succeeded', {
@@ -176,15 +274,32 @@ describe('POST /webhooks/stripe', () => {
     expect(res.body).toEqual({ received: true, type: 'payment_intent.succeeded' });
     expect(fake.bookingUpdate).toHaveBeenCalledWith({ status: 'confirmed' });
     expect(fake.slotUpdate).toHaveBeenCalledWith({ is_booked: true });
-    expect(fake.fromCalls).toEqual(['bookings', 'bookings', 'availability_slots']);
+    expect(fake.fromCalls).toEqual([
+      'bookings',
+      'bookings',
+      'availability_slots',
+      'listings',
+      'availability_slots',
+      'profiles',
+      'profiles',
+    ]);
+    expect(emailMock.sendBookingConfirmationEmail).toHaveBeenCalledTimes(1);
+    expect(emailMock.sendBookingConfirmationEmail).toHaveBeenCalledWith({
+      bookingId: BOOKING_ID,
+      buyerEmail: 'buyer@example.com',
+      buyerName: 'Buyer User',
+      sellerEmail: 'seller@example.com',
+      sellerName: 'Seller User',
+      listingTitle: 'Sunlit Photography Studio',
+      slotStart: '2026-08-01T10:00:00.000Z',
+      slotEnd: '2026-08-01T12:00:00.000Z',
+      amountCents: 8500,
+    });
   });
 
   it('is idempotent on a replayed payment_intent.succeeded (no duplicate side effects)', async () => {
     const fake = createFakeSupabase({
-      bookingSelectResult: {
-        data: { id: BOOKING_ID, status: 'confirmed', slot_id: SLOT_ID },
-        error: null,
-      },
+      bookingSelectResult: confirmedBooking(),
       slotSelectResult: { data: { is_booked: true }, error: null },
     });
     supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
@@ -198,14 +313,15 @@ describe('POST /webhooks/stripe', () => {
     expect(res.status).toBe(200);
     expect(fake.bookingUpdate).not.toHaveBeenCalled();
     expect(fake.slotUpdate).not.toHaveBeenCalled();
+    // A replay re-attempts the email (it is the retry vehicle for a send that
+    // threw on the first attempt); duplicate delivery is prevented by Resend's
+    // per-booking idempotency keys, asserted in lib/email tests.
+    expect(emailMock.sendBookingConfirmationEmail).toHaveBeenCalledTimes(1);
   });
 
   it('self-heals a slot left unbooked by a partially-failed earlier attempt on replay', async () => {
     const fake = createFakeSupabase({
-      bookingSelectResult: {
-        data: { id: BOOKING_ID, status: 'confirmed', slot_id: SLOT_ID },
-        error: null,
-      },
+      bookingSelectResult: confirmedBooking(),
       slotSelectResult: { data: { is_booked: false }, error: null },
     });
     supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
@@ -219,6 +335,7 @@ describe('POST /webhooks/stripe', () => {
     expect(res.status).toBe(200);
     expect(fake.bookingUpdate).not.toHaveBeenCalled();
     expect(fake.slotUpdate).toHaveBeenCalledWith({ is_booked: true });
+    expect(emailMock.sendBookingConfirmationEmail).toHaveBeenCalledTimes(1);
   });
 
   it('returns 500 (triggering a Stripe retry) when the booking is not found', async () => {
@@ -235,14 +352,12 @@ describe('POST /webhooks/stripe', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe('INTERNAL_ERROR');
+    expect(emailMock.sendBookingConfirmationEmail).not.toHaveBeenCalled();
   });
 
   it('returns 500 (triggering a Stripe retry) when the booking update fails', async () => {
     const fake = createFakeSupabase({
-      bookingSelectResult: {
-        data: { id: BOOKING_ID, status: 'pending', slot_id: SLOT_ID },
-        error: null,
-      },
+      bookingSelectResult: pendingBooking(),
       bookingUpdateError: { message: 'connection reset' },
     });
     supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
@@ -255,14 +370,12 @@ describe('POST /webhooks/stripe', () => {
 
     expect(res.status).toBe(500);
     expect(fake.slotUpdate).not.toHaveBeenCalled();
+    expect(emailMock.sendBookingConfirmationEmail).not.toHaveBeenCalled();
   });
 
   it('returns 500 (triggering a Stripe retry) when the slot update fails', async () => {
     const fake = createFakeSupabase({
-      bookingSelectResult: {
-        data: { id: BOOKING_ID, status: 'pending', slot_id: SLOT_ID },
-        error: null,
-      },
+      bookingSelectResult: pendingBooking(),
       slotUpdateError: { message: 'connection reset' },
     });
     supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
@@ -275,6 +388,41 @@ describe('POST /webhooks/stripe', () => {
 
     expect(res.status).toBe(500);
     expect(fake.bookingUpdate).toHaveBeenCalledWith({ status: 'confirmed' });
+    expect(emailMock.sendBookingConfirmationEmail).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 (triggering a Stripe retry) when the confirmation email fails to send', async () => {
+    const fake = createFakeSupabase({ bookingSelectResult: pendingBooking() });
+    supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
+    emailMock.sendBookingConfirmationEmail.mockRejectedValueOnce(new Error('Resend is down'));
+
+    const { payload, signature } = signedEvent('payment_intent.succeeded', {
+      status: 'succeeded',
+    });
+
+    const res = await postEvent(payload, signature);
+
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('INTERNAL_ERROR');
+    expect(fake.bookingUpdate).toHaveBeenCalledWith({ status: 'confirmed' });
+    expect(fake.slotUpdate).toHaveBeenCalledWith({ is_booked: true });
+  });
+
+  it('acks the webhook when a missing buyer email makes the email un-sendable (booking already saved)', async () => {
+    const fake = createFakeSupabase({
+      bookingSelectResult: pendingBooking(),
+      buyerUserResult: { data: { user: null }, error: null },
+    });
+    supabaseMock.getSupabase.mockReturnValue(fake.supabase as unknown as SupabaseClient);
+
+    const { payload, signature } = signedEvent('payment_intent.succeeded', {
+      status: 'succeeded',
+    });
+
+    const res = await postEvent(payload, signature);
+
+    expect(res.status).toBe(200);
+    expect(emailMock.sendBookingConfirmationEmail).not.toHaveBeenCalled();
   });
 
   it('leaves the booking pending on payment_intent.payment_failed', async () => {
