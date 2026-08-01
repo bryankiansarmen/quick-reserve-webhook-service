@@ -1,6 +1,7 @@
 import express from 'express';
 
 import { stripeRouter } from './webhooks/stripe';
+import { notificationsRouter } from './notifications/notifications';
 import { log } from './lib/log';
 import type { RawBodyRequest } from './types';
 
@@ -37,6 +38,9 @@ export function createApp(): express.Express {
 
   // Stripe webhooks
   app.use('/webhooks', stripeRouter);
+
+  // Internal app-to-service notifications (e.g. booking cancellation emails)
+  app.use('/notifications', notificationsRouter);
 
   return app;
 }

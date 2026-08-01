@@ -10,7 +10,7 @@ dotenv.config({ path: '.env.local' });
 // RESEND_API_KEY are consumed by the webhook handler and email feature
 // warned below instead of blocking the health endpoint.
 const requiredEnvVars = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'STRIPE_SECRET_KEY'] as const;
-const featureEnvVars = ['STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY'] as const;
+const featureEnvVars = ['STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY', 'INTERNAL_NOTIFICATION_TOKEN'] as const;
 
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
